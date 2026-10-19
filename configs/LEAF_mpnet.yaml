@@ -41,6 +41,12 @@ instruct:
   weight_decay: 1.0e-3
   check_val_every_n_epoch: 10
   save_ckpt_every_n_epoch: 10    # periodic checkpoint cadence; null = only save the final LEAF_Instruct.ckpt
+  temperature:
+    enabled: true
+    scale_init: 1.0             # s = exp(logit_scale) = 1 / temperature
+    scale_min: 0.01
+    scale_max: 100.0
+    lr: 2.0e-4                 # same schedule as other parameter groups; no weight decay
 
 downstream:
   lr_base: 1.0e-3

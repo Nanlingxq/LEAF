@@ -6,6 +6,8 @@ licensed under the CBCR License 1.0 (see LICENSE).
 """
 
 import argparse
+import csv
+import hashlib
 import math
 import os
 import random
@@ -139,11 +141,30 @@ class Instruct_Tuning_Module(pl.LightningModule):
         n = getattr(train_config, 'save_ckpt_every_n_epoch', 10)
         self.save_ckpt_every_n_epoch = None if (n is None or str(n).lower() == 'none') else int(n)
 
-        # s = exp(logit_scale) = 1 / temperature
-        # 初始化s=1，保持初始logits与原实现一致
-        self.logit_scale = torch.nn.Parameter(
-            torch.tensor(math.log(1.0), dtype=torch.float32)
-        )
+        temperature = getattr(train_config, 'temperature', {})
+        if not isinstance(temperature, dict):
+            raise ValueError('instruct.temperature must be a mapping')
+        self.temperature_enabled = temperature.get('enabled', False)
+        if not isinstance(self.temperature_enabled, bool):
+            raise ValueError('temperature.enabled must be a boolean')
+        self.temperature_history = []
+        if self.temperature_enabled:
+            self.scale_min = float(temperature.get('scale_min', 0.01))
+            self.scale_max = float(temperature.get('scale_max', 100.0))
+            self.scale_init = float(temperature.get('scale_init', 1.0))
+            self.temperature_lr = float(temperature.get(
+                'lr', self.lr_base * self.lr_scale_slow_params))
+            values = (self.scale_min, self.scale_init, self.scale_max, self.temperature_lr)
+            if not all(math.isfinite(v) for v in values):
+                raise ValueError('temperature settings must be finite')
+            if not 0 < self.scale_min <= self.scale_init <= self.scale_max:
+                raise ValueError('Require 0 < scale_min <= scale_init <= scale_max')
+            if self.temperature_lr <= 0:
+                raise ValueError('temperature.lr must be positive')
+            self.logit_scale = torch.nn.Parameter(
+                torch.tensor(math.log(self.scale_init), dtype=torch.float32))
+        else:
+            self.register_parameter('logit_scale', None)
 
         self.valLoss = []
         self.register_buffer('prototypes', F.normalize(torch.tensor(prototypes), dim=-1).t())
@@ -164,21 +185,18 @@ class Instruct_Tuning_Module(pl.LightningModule):
 
     def compute_logits(self, x, instruct_emb):
         emb, _ = self.model(x, instruct_emb)
+        if not self.temperature_enabled:
+            return emb @ self.prototypes
+        # Explicitly leave autocast: float() alone does not force FP32 matmul.
+        with torch.autocast(device_type=emb.device.type, enabled=False):
+            cosine_logits = emb.float() @ self.prototypes.float()
+            return self.logit_scale.float().exp() * cosine_logits
 
-        # 在FP32中计算余弦logits及尺度
-        cosine_logits = emb.float() @ self.prototypes.float()
-        return self.logit_scale.exp() * cosine_logits
+    @torch.no_grad()
+    def on_train_batch_end(self, outputs, batch, batch_idx):
+        if self.temperature_enabled:
+            self.logit_scale.clamp_(math.log(self.scale_min), math.log(self.scale_max))
 
-    # def configure_optimizers(self):
-    #     fastLR_params = list(self.model.tower.tokenizer.parameters()) # 将 Tokenizer 设置为快学习率参数
-    #     fast_ids = set(id(p) for p in fastLR_params)
-    #     slowLR_params = [p for p in self.model.parameters() if id(p) not in fast_ids] # 将其余参数设置为慢学习率参数
-    #     self.optimizer = optim.AdamW([
-    #         {"params": fastLR_params, "lr": self.lr_base * self.lr_scale_fast_params},
-    #         {"params": slowLR_params, "lr": self.lr_base * self.lr_scale_slow_params},
-    #     ], weight_decay=self.weight_decay)
-    #     scheduler = optim.lr_scheduler.LambdaLR(self.optimizer, make_lr_lambda(self.lr_list))
-    #     return [self.optimizer], [{'scheduler': scheduler, 'interval': 'step'}]
     def configure_optimizers(self):
         fast_params = list(self.model.tower.tokenizer.parameters())
         fast_ids = {id(p) for p in fast_params}
@@ -190,24 +208,14 @@ class Instruct_Tuning_Module(pl.LightningModule):
 
         slow_lr = self.lr_base * self.lr_scale_slow_params
 
-        self.optimizer = optim.AdamW(
-            [
-                {
-                    "params": fast_params,
-                    "lr": self.lr_base * self.lr_scale_fast_params,
-                },
-                {
-                    "params": slow_params,
-                    "lr": slow_lr,
-                },
-                {
-                    "params": [self.logit_scale],
-                    "lr": slow_lr,
-                    "weight_decay": 0.0,
-                },
-            ],
-            weight_decay=self.weight_decay,
-        )
+        groups = [
+            {"params": fast_params, "lr": self.lr_base * self.lr_scale_fast_params},
+            {"params": slow_params, "lr": slow_lr},
+        ]
+        if self.temperature_enabled:
+            groups.append({"params": [self.logit_scale],
+                           "lr": self.temperature_lr, "weight_decay": 0.0})
+        self.optimizer = optim.AdamW(groups, weight_decay=self.weight_decay)
 
         scheduler = optim.lr_scheduler.LambdaLR(
             self.optimizer,
@@ -220,24 +228,23 @@ class Instruct_Tuning_Module(pl.LightningModule):
 
     def training_step(self, batch, batch_idx):
         x, instruct_emb, y = batch
-        # emb, _ = self.model(x, instruct_emb)
-        # logits = emb @ self.prototypes # 计算得出的emb与数据集标签 emb之间的余弦相似度 (之前做过 L2归一化)
         logits = self.compute_logits(x, instruct_emb)
-        # Cross-entropy over cosine-similarity logits simultaneously pulls the output
-        # embedding toward the correct prototype and pushes it away from all incorrect
-        # ones via the softmax denominator — both forces are required since prototypes
-        # are frozen and the Q-Former is the only thing being trained.
+        # Frozen text prototypes supervise both the Tower and Q-Former.
         loss = F.cross_entropy(logits, y)
         return loss
 
     def validation_step(self, batch, batch_idx, dataloader_idx=0):
         x, instruct_emb, y = batch
-        emb, _ = self.model(x, instruct_emb)
-        logits = emb @ self.prototypes
+        logits = self.compute_logits(x, instruct_emb)
         loss = F.cross_entropy(logits, y)
         acc = (logits.argmax(dim=-1) == y).float().mean()
         self.log("loss", loss, on_epoch=True, sync_dist=True)
         self.log("acc", acc, on_epoch=True, sync_dist=True)
+        if self.temperature_enabled:
+            # Keep an unscaled CE for interpretation across changing temperatures.
+            raw_logits = logits / self.logit_scale.exp()
+            self.log("loss_unscaled", F.cross_entropy(raw_logits, y),
+                     on_epoch=True, sync_dist=True)
 
     def on_validation_epoch_end(self):
         if self.trainer.sanity_checking or self.global_rank != 0:
@@ -247,14 +254,56 @@ class Instruct_Tuning_Module(pl.LightningModule):
         self.valLoss.append([loss, acc])
         print(f'{self.current_epoch} valLoss:{loss:.4f} valAcc:{acc:.4f}')
 
+    def _save_temperature(self, save_fn):
+        """Save loss-only state separately, preserving the LEAF checkpoint format."""
+        path = Path(str(save_fn) + '.temperature.pt')
+        temporary = path.with_suffix(path.suffix + '.tmp')
+        with open(save_fn, 'rb') as checkpoint:
+            model_sha256 = self._checkpoint_sha256(checkpoint)
+        scale = self.logit_scale.detach().float().exp().cpu()
+        torch.save({
+            'schema_version': 1, 'epoch': self.current_epoch + 1,
+            'global_step': self.global_step, 'model_sha256': model_sha256,
+            'logit_scale': self.logit_scale.detach().float().cpu(),
+            'scale': scale, 'temperature': scale.reciprocal(),
+            'scale_init': self.scale_init, 'scale_min': self.scale_min,
+            'scale_max': self.scale_max, 'lr_peak': self.temperature_lr,
+            'weight_decay': 0.0,
+        }, temporary)
+        temporary.replace(path)
+
+    @staticmethod
+    def _checkpoint_sha256(stream):
+        digest = hashlib.sha256()
+        for block in iter(lambda: stream.read(1024 * 1024), b''):
+            digest.update(block)
+        return digest.hexdigest()
+
     def on_train_epoch_end(self):
         if self.trainer.sanity_checking or self.global_rank != 0:
             return
         n = self.save_ckpt_every_n_epoch
+        if self.temperature_enabled:
+            scale = self.logit_scale.detach().float().exp().item()
+            row = {'epoch': self.current_epoch + 1, 'global_step': self.global_step,
+                   'logit_scale': self.logit_scale.detach().item(),
+                   'scale': scale, 'temperature': 1.0 / scale,
+                   'lr': self.optimizer.param_groups[-1]['lr']}
+            self.temperature_history.append(row)
+            history_path = Path(fn_save_ckpt(self.current_epoch)).parent / 'temperature_history.csv'
+            temporary = history_path.with_suffix('.csv.tmp')
+            with temporary.open('w', newline='') as handle:
+                writer = csv.DictWriter(handle, fieldnames=list(row))
+                writer.writeheader()
+                writer.writerows(self.temperature_history)
+            temporary.replace(history_path)
+            print(f'Epoch {row["epoch"]}: scale={scale:.6f}, temperature={1.0 / scale:.6f}')
         if n and (self.current_epoch + 1) % n == 0:
             save_fn = fn_save_ckpt(self.current_epoch)
             print(yellow(f'Saving checkpoint at epoch {self.current_epoch + 1} -> {save_fn}'))
             save_model_safely(self.model, save_fn)
+            if self.temperature_enabled:
+                self._save_temperature(save_fn)
 
 if __name__ == '__main__':
     p = argparse.ArgumentParser()

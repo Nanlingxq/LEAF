@@ -12,3 +12,8 @@ original_repos:  https://github.com/Winds-Studio/Leaf
   year={2026}
 }
 ```
+
+## 本仓库改动
+
+- [可学习温度的配置、日志与兼容性](docs/temperature-training.md)：指令微调代码已完成修改，V3.3实验尚未执行。
+- [改动记录](CHANGELOG.md)：每次代码修改的说明与验证。参与修改前请读取根[AGENTS.md](AGENTS.md)，完成检查后提交并推送代码与对应说明。

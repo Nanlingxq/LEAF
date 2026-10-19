@@ -212,7 +212,6 @@ __marimo__/
 # Local experiment state and large model/data outputs
 /artifacts/
 /.codex/
-/AGENTS.md
 /cpt/
 /ckpt/
 /checkpoint/
