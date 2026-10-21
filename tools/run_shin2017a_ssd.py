@@ -188,11 +188,16 @@ def scan_importance(model, embedding, x, y, device, batch_size):
     for name, value in averaged.items():
         if not torch.isfinite(value).all():
             raise FloatingPointError(f"Non-finite importance values: {name}")
+    parameter_names = [name for name, _ in params]
+    gradient_names = {name for name in parameter_names if non_none.get(name, 0) > 0}
+    no_gradient_names = sorted(set(parameter_names) - gradient_names)
     return averaged, {
         "samples": len(y),
         "elapsed_seconds": elapsed,
-        "parameters_with_any_gradient": sum(count > 0 for count in non_none.values()),
-        "parameters_without_gradient": sum(count == 0 for count in non_none.values()),
+        "parameter_tensor_count": len(parameter_names),
+        "parameters_with_any_gradient": len(gradient_names),
+        "parameters_without_gradient": len(no_gradient_names),
+        "no_gradient_parameter_names": no_gradient_names,
         "non_none_gradient_trials_by_parameter": dict(non_none),
     }
 
@@ -313,6 +318,16 @@ def run_importance(config):
 
 
 def run_update(config):
+    expected_gpu = str(config["execution"]["cuda_visible_devices"])
+    if os.environ.get("CUDA_VISIBLE_DEVICES") != expected_gpu:
+        raise RuntimeError(f"Set CUDA_VISIBLE_DEVICES={expected_gpu} as archived in the effective config")
+    if not torch.cuda.is_available() or torch.cuda.device_count() != 1:
+        raise RuntimeError("Expected exactly one visible CUDA device from the configured physical GPU")
+    torch.backends.cuda.matmul.allow_tf32 = False
+    torch.backends.cudnn.allow_tf32 = False
+    torch.set_float32_matmul_precision("highest")
+    device = torch.device("cuda:0")
+    torch.cuda.reset_peak_memory_stats(device)
     formula_cfg = config["ssd"]
     input_path = config["checkpointing"]["original"]["best_retain_validation"]
     original_hash = config["checkpoint_hashes"]["original"]
@@ -338,28 +353,29 @@ def run_update(config):
         target_imp = importance["target"][name]
         if original.shape != retain_imp.shape or original.shape != target_imp.shape:
             raise ValueError(f"Shape mismatch for {name}")
+        original_gpu = original.to(device)
         new_value, selected, scale = apply_ssd_tensor(
-            original,
-            retain_imp.float(),
-            target_imp.float(),
+            original_gpu,
+            retain_imp.to(device=device, dtype=torch.float32),
+            target_imp.to(device=device, dtype=torch.float32),
             float(formula_cfg["selection_weighting"]),
             float(formula_cfg["dampening_constant"]),
             float(formula_cfg["exponent"]),
         )
-        changed = new_value != original
-        if not torch.equal(new_value[~selected], original[~selected]):
+        changed = new_value != original_gpu
+        if not torch.equal(new_value[~selected], original_gpu[~selected]):
             raise RuntimeError(f"Unselected values changed: {name}")
-        if (new_value[selected].abs() > original[selected].abs() + 1e-7).any():
+        if (new_value[selected].abs() > original_gpu[selected].abs() + 1e-7).any():
             raise RuntimeError(f"Selected weight magnitude increased: {name}")
         if not torch.isfinite(new_value).all():
             raise FloatingPointError(f"Updated parameter is non-finite: {name}")
-        updated[name] = new_value
+        updated[name] = new_value.detach().cpu()
         layer = name.split(".", 1)[0]
         row = stats[layer]
         row["elements"] += original.numel()
         row["selected"] += int(selected.sum())
         row["changed"] += int(changed.sum())
-        row["l2_delta_sq"] += float((new_value.float() - original.float()).square().sum())
+        row["l2_delta_sq"] += float((new_value.float() - original_gpu.float()).square().sum())
         row["weight_l2_sq"] += float(original.float().square().sum())
         selected_scales = scale[selected]
         if selected_scales.numel():
@@ -406,6 +422,13 @@ def run_update(config):
         "state_dict_buffers_unchanged": len(buffers),
         "all_finite": True,
         "test_data_loaded": False,
+        "device": {
+            "physical_gpu": int(expected_gpu),
+            "logical_device": str(device),
+            "name": torch.cuda.get_device_name(device),
+            "peak_allocated_mib": torch.cuda.max_memory_allocated(device) / 1024**2,
+            "peak_reserved_mib": torch.cuda.max_memory_reserved(device) / 1024**2,
+        },
         "layers": layer_results,
     }
     write_json(config["outputs"]["update_json"], result)
