@@ -262,6 +262,7 @@ def run_importance(config):
     torch.backends.cudnn.allow_tf32 = False
     torch.set_float32_matmul_precision("highest")
     device = torch.device("cuda:0")
+    torch.cuda.set_device(device)
     data = input_data(config)
     # Arrays are aligned with the split manifest's train rows.
     train_target = np.asarray([row["subject"] == config["dataset"]["target_subject"] for row in data["train_rows"]])
@@ -327,6 +328,7 @@ def run_update(config):
     torch.backends.cudnn.allow_tf32 = False
     torch.set_float32_matmul_precision("highest")
     device = torch.device("cuda:0")
+    torch.cuda.set_device(device)
     torch.cuda.reset_peak_memory_stats(device)
     formula_cfg = config["ssd"]
     input_path = config["checkpointing"]["original"]["best_retain_validation"]
@@ -480,6 +482,7 @@ def run_evaluation(config):
     torch.backends.cudnn.allow_tf32 = False
     torch.set_float32_matmul_precision("highest")
     device = torch.device("cuda:0")
+    torch.cuda.set_device(device)
     eval_started = time.perf_counter()
     data = input_data(config, include_test=True)
     partitions = {
