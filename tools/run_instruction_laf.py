@@ -150,9 +150,16 @@ def worker(config, variant, prep):
     masks = {n: (torch.ones_like(p, dtype=torch.bool) if variant=="laf_all" and n in active
                  else saved_masks[mode][n].cuda() if n in active else torch.zeros_like(p, dtype=torch.bool))
              for n, p in model.named_parameters()}
+    torch.cuda.synchronize()
+    torch.cuda.reset_peak_memory_stats()
+    damp_seconds = 0.
     if variant in ("ssd_only", "ssd_then_laf_mask"):
         statistics = torch.load(config["importance_path"], map_location="cpu", weights_only=True)
+        torch.cuda.synchronize()
+        damp_started = time.monotonic()
         dampen(torch, model, masks, statistics["means"]["overall"], statistics["means"]["S01"])
+        torch.cuda.synchronize()
+        damp_seconds = time.monotonic()-damp_started
         del statistics
     baseline = {n: p.detach().clone() for n, p in model.named_parameters()}
     buffers = {n: t.detach().clone() for n, t in model.named_buffers()}
@@ -160,7 +167,6 @@ def worker(config, variant, prep):
         p.requires_grad_(n in active and variant!="ssd_only")
     prep.atomic_save(torch, model.state_dict(), out/"epoch000.ckpt")
     torch.cuda.synchronize()
-    torch.cuda.reset_peak_memory_stats()
     started = time.monotonic()
     curve = []
     if variant!="ssd_only":
@@ -242,7 +248,8 @@ def worker(config, variant, prep):
               "unselected_exactly_unchanged": True, "inactive_parameters_unchanged": True, "buffers_unchanged": True,
               "text_cache_frozen": True, "teacher_source": "fixed original embeddings cache", "request_task_labels_accessed": False,
               "target_validation_or_tests_loaded": False, "target_VAE_epochs": 200,
-              "elapsed_gpu_synchronized_seconds": elapsed,
+              "elapsed_gpu_synchronized_seconds": elapsed+damp_seconds,
+              "direct_damp_gpu_seconds": damp_seconds,
               "peak_allocated_mib": torch.cuda.max_memory_allocated()/2**20,
               "peak_reserved_mib": torch.cuda.max_memory_reserved()/2**20}
     prep.write_json(out/"completed.json", report)
