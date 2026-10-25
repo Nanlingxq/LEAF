@@ -157,7 +157,7 @@ def worker(config, variant, prep):
         statistics = torch.load(config["importance_path"], map_location="cpu", weights_only=True)
         torch.cuda.synchronize()
         damp_started = time.monotonic()
-        dampen(torch, model, masks, statistics["means"]["overall"], statistics["means"]["S01"])
+        dampen(torch, model, masks, statistics["means"]["overall"], statistics["means"][config.get("target_subject", "S01")])
         torch.cuda.synchronize()
         damp_seconds = time.monotonic()-damp_started
         del statistics
