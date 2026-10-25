@@ -20,3 +20,7 @@ python tools/run_instruction_unlearning.py --run-dir /path/to/LEAF-main/.codex/r
 准备队列完成后停在复查点。需要检查掩码覆盖范围、VAE重构误差与固定均值基线、潜变量和输入梯度，再实施计划中的全部即时对照、损失消融、统一评估、后续学习和连续请求。此入口目前不把这些后续部分标为已完成，也不依据测试结果自动搜索参数。
 
 检查运行时读取 `artifacts/<run-id>/runner-state.json`、`retrain-progress.json`、`importance/progress.json` 和运行档案中的阶段日志。完整配置及其SHA256记录在 `manifest.json`；合成检查与模型预检证据保存在 `checks/`。源数据、权重、表征缓存和 VAE 仅保留在实验室服务器的运行产物中，不随源码推送到 GitHub。
+
+## 目标VAE的训练内诊断
+
+准备检查发现目标VAE在原定50轮下可能弱于固定均值重构时，先保存该结果并核对缓存、潜变量和重构偏差。`tools/diagnose_instruction_vae.py` 可在单独的完整配置下执行固定200轮诊断，记录第50、100、200轮的训练表征重构，检查第50轮是否复现原始权重。该入口只读取历史训练表征，诊断权重单独存放；它不自动替换计划中固定50轮的正式产物。正式采用新的VAE训练预算前，需要明确记录协议决定。
